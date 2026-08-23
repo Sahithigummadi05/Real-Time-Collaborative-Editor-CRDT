@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Collaborative Editor — RGA CRDT</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1115; --panel:#171a21; --border:#2a2f3a; --text:#e6e8eb; --muted:#9aa3b2; --accent:#4f8cff; --ok:#33c17a; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --panel:#fff; --border:#e2e5ea; --text:#1a1d23; --muted:#5a6472; } }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,Segoe UI,Roboto,sans-serif; margin:0; padding:2rem; }
+  h1 { font-size:1.2rem; margin:0 0 .25rem; }
+  .sub { color:var(--muted); font-size:.85rem; margin:0 0 1.25rem; }
+  .bar { display:flex; gap:1rem; align-items:center; margin-bottom:.75rem; font-size:.85rem; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); display:inline-block; margin-right:.4rem; }
+  .dot.on { background:var(--ok); }
+  textarea { width:100%; height:320px; box-sizing:border-box; background:var(--panel); color:var(--text);
+             border:1px solid var(--border); border-radius:10px; padding:1rem; font-family:ui-monospace,Menlo,monospace;
+             font-size:.95rem; line-height:1.5; resize:vertical; }
+  textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .meta { margin-top:.75rem; color:var(--muted); font-size:.8rem; font-variant-numeric:tabular-nums; }
+  code { background:var(--panel); border:1px solid var(--border); border-radius:4px; padding:.1rem .35rem; }
+</style>
+</head>
+<body>
+  <h1>Collaborative Editor</h1>
+  <p class="sub">Open this page in two tabs and type in both. Edits merge without conflicts — no locking, no server arbitration.</p>
+
+  <div class="bar">
+    <span><span class="dot" id="dot"></span><span id="status">connecting…</span></span>
+    <span>replica <code id="replica"></code></span>
+  </div>
+
+  <textarea id="editor" spellcheck="false" placeholder="Start typing…"></textarea>
+  <div class="meta">
+    <span id="stats"></span>
+  </div>
+
+<script type="module">
+import { RgaDocument } from './rga.js';
+
+const replicaId = Math.random().toString(36).slice(2, 8);
+const doc = new RgaDocument(replicaId);
+const editor = document.getElementById('editor');
+const statusEl = document.getElementById('status');
+const dotEl = document.getElementById('dot');
+const statsEl = document.getElementById('stats');
+document.getElementById('replica').textContent = replicaId;
+
+let socket;
+let applyingRemote = false;
+
+function render() {
+  const text = doc.text();
+  if (editor.value !== text) {
+    // Preserve the caret across remote edits: if text landed before the caret, shift it.
+    const start = editor.selectionStart;
+    const end = editor.selectionEnd;
+    const delta = text.length - editor.value.length;
+    editor.value = text;
+    const before = editor.value.slice(0, start);
+    editor.selectionStart = start + (before !== text.slice(0, start) ? delta : 0);
+    editor.selectionEnd = editor.selectionStart + (end - start);
+  }
+  statsEl.textContent = `${doc.length()} characters · ${doc.elements.length} elements incl. tombstones`;
+}
+
+function send(op) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'op', op }));
+  }
+}
+
+/**
+ * Turn a textarea value change into CRDT operations by diffing old vs new around a common
+ * prefix/suffix. A production editor would hook `beforeinput` for precise intent, but diffing
+ * keeps the demo dependency-free and handles paste, delete, and multi-character input uniformly.
+ */
+function reconcile(previous, next) {
+  let prefix = 0;
+  while (prefix < previous.length && prefix < next.length && previous[prefix] === next[prefix]) prefix++;
+
+  let suffix = 0;
+  while (suffix < previous.length - prefix && suffix < next.length - prefix
+         && previous[previous.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix++;
+
+  const removed = previous.length - prefix - suffix;
+  const added = next.slice(prefix, next.length - suffix);
+
+  // Delete right-to-left so earlier indices stay valid as we go.
+  for (let i = 0; i < removed; i++) send(doc.deleteAt(prefix + removed - 1 - i));
+  for (let i = 0; i < added.length; i++) send(doc.insertAt(prefix + i, added[i]));
+}
+
+editor.addEventListener('input', () => {
+  if (applyingRemote) return;
+  reconcile(doc.text(), editor.value);
+  render();
+});
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  socket = new WebSocket(`${proto}//${location.host}/ws/editor`);
+
+  socket.onopen = () => { statusEl.textContent = 'connected'; dotEl.classList.add('on'); };
+  socket.onclose = () => {
+    statusEl.textContent = 'disconnected — retrying';
+    dotEl.classList.remove('on');
+    // Local editing keeps working while disconnected; queued ops converge on reconnect.
+    setTimeout(connect, 1000);
+  };
+  socket.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    applyingRemote = true;
+    if (msg.type === 'sync') msg.ops.forEach((op) => doc.apply(op));
+    else if (msg.type === 'op') doc.apply(msg.op);
+    applyingRemote = false;
+    render();
+  };
+}
+
+connect();
+render();
+</script>
+</body>
+</html>
