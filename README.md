@@ -1,6 +1,6 @@
 # Collaborative Text Editor (RGA CRDT)
 
-![CI](https://github.com/Sahithigummadi05/project3/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/Sahithigummadi05/project3/actions/workflows/ci.yml/badge.svg)](https://github.com/Sahithigummadi05/project3/actions/workflows/ci.yml)
 
 A real-time collaborative editor — open it in two tabs, type in both at once, and the edits merge
 without conflicts. There is no locking, no "last write wins", and no server deciding whose edit
