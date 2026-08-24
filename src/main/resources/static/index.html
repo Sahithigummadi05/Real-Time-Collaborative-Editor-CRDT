@@ -60,13 +60,40 @@ function render() {
     editor.selectionStart = start + (before !== text.slice(0, start) ? delta : 0);
     editor.selectionEnd = editor.selectionStart + (end - start);
   }
-  statsEl.textContent = `${doc.length()} characters · ${doc.elements.length} elements incl. tombstones`;
+  const queued = outbox.length > 0 ? ` · ${outbox.length} edit(s) queued for sync` : '';
+  const held = doc.pendingOperationCount() > 0
+    ? ` · ${doc.pendingOperationCount()} awaiting dependencies` : '';
+  statsEl.textContent = `${doc.length()} characters${queued}${held}`;
 }
 
+/**
+ * Outbox for operations that haven't reached the server yet.
+ *
+ * Without this, editing while disconnected silently loses work: the characters appear locally
+ * (the local replica applied them) but no other replica ever hears about them, so the document
+ * looks fine to you and is permanently missing your edits for everyone else. Queuing is what
+ * actually makes "keep typing while offline" true rather than merely plausible.
+ *
+ * Resending is safe: every operation carries a unique id and both the server and every replica
+ * ignore ids they have already applied, so a flush that overlaps with what the server received
+ * before the connection dropped cannot duplicate characters.
+ */
+const outbox = [];
+
 function send(op) {
-  if (socket && socket.readyState === WebSocket.OPEN) {
+  outbox.push(op);
+  flushOutbox();
+}
+
+function flushOutbox() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  while (outbox.length > 0) {
+    // Peek rather than shift: if send() throws mid-flush the operation stays queued.
+    const op = outbox[0];
     socket.send(JSON.stringify({ type: 'op', op }));
+    outbox.shift();
   }
+  render();
 }
 
 /**
@@ -100,12 +127,18 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   socket = new WebSocket(`${proto}//${location.host}/ws/editor`);
 
-  socket.onopen = () => { statusEl.textContent = 'connected'; dotEl.classList.add('on'); };
+  socket.onopen = () => {
+    statusEl.textContent = 'connected';
+    dotEl.classList.add('on');
+    // Anything typed while the connection was down goes out now.
+    flushOutbox();
+  };
   socket.onclose = () => {
     statusEl.textContent = 'disconnected — retrying';
     dotEl.classList.remove('on');
-    // Local editing keeps working while disconnected; queued ops converge on reconnect.
+    // Editing keeps working: operations accumulate in the outbox and flush on reconnect.
     setTimeout(connect, 1000);
+    render();
   };
   socket.onmessage = (event) => {
     const msg = JSON.parse(event.data);

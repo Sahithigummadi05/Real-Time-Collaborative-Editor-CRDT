@@ -67,13 +67,38 @@ proves nothing; this one demonstrably fails when the algorithm is broken.
 | `RgaConvergenceTest` | Random 4-replica histories converge across 250 randomized causal replays |
 | `SkipRuleIsLoadBearingTest` | Removing RGA's ordering rule *does* cause divergence — the tests can fail |
 | `OutOfOrderDeliveryTest` | Convergence survives fully reversed and arbitrarily shuffled (non-causal) delivery |
+| `CrossImplementationConformanceTest` | The Java and JavaScript implementations produce byte-identical documents |
 | `RgaDocumentTest` | Insert/delete/tombstone semantics, idempotent replay, Lamport clock advance |
 | `RgaPerformanceTest` | Insert cost stays flat as the document grows |
 | `EditorSyncIntegrationTest` | Two and three real WebSocket clients converge end-to-end through the running server |
+| `OfflineReconnectIntegrationTest` | Edits made while disconnected survive; partitioned replicas merge on reconnect |
 
 ```
-39 tests, 0 failures
+46 tests, 0 failures
 ```
+
+## Two implementations, one algorithm
+
+RGA exists twice here: in Java for the server, and in JavaScript so each browser tab holds a real
+replica and can edit without a round-trip. **That duplication is the most dangerous thing in the
+codebase.** Both sides pass their own tests, both look correct in review, and if they ever disagree
+about how to order two concurrent inserts, replicas diverge silently — producing exactly the
+corruption the project exists to prevent. No per-language test suite can catch it, because each
+one only ever compares an implementation against itself.
+
+So they're compared against each other directly. `CrossImplementationConformanceTest` generates
+operation histories, runs them through the Java implementation and — by shelling out to Node —
+through the browser implementation, and requires the resulting documents to match character for
+character. It covers heavy concurrency at identical positions (where tie-breaking decides the
+outcome), fully reversed delivery, and arbitrary non-causal shuffles (where the buffering logic has
+to behave identically on both sides).
+
+**Verified to catch real divergence.** Flipping a single comparison in the JavaScript tie-break —
+`a.replicaId < b.replicaId ? -1 : 1` to `? 1 : -1` — makes all four conformance tests fail
+immediately, and restoring it makes them pass. The harness detects a one-character difference in
+ordering policy between the two languages.
+
+The test skips rather than fails when Node isn't installed, so a JVM-only machine can still build.
 
 ## Surviving a network that reorders
 
@@ -149,8 +174,30 @@ transforms one edit against another — that's the point of using a CRDT instead
 replica only so a client joining an hour late has somewhere to fetch history from. The clients
 would still converge if they gossiped directly.
 
-Each tab holds a **real replica**, so local edits apply instantly without a server round-trip, and
-a disconnected tab keeps working — its operations converge on reconnect.
+Each tab holds a **real replica**, so local edits apply instantly without a server round-trip.
+
+## Editing offline
+
+A disconnected tab keeps working, and this is the second bug the project shipped with before it
+was tested properly. The client's `send()` looked reasonable:
+
+```js
+if (socket && socket.readyState === WebSocket.OPEN) socket.send(...);   // else: silently dropped
+```
+
+Locally everything looked fine — the characters appeared, because the local replica had applied
+them. But nothing was queued, so every edit typed while the socket was down was **permanently
+invisible to every other replica**. The README claimed offline edits "converge on reconnect" while
+the code quietly discarded them.
+
+Operations now go to an **outbox** and flush on reconnect. Resending is safe by construction: every
+operation carries a unique id, and both the server and every replica ignore ids they have already
+applied, so a flush overlapping with what the server received before the drop cannot duplicate
+characters.
+
+`OfflineReconnectIntegrationTest` drives this against the real server — including a full network
+partition where both clients disconnect, edit independently, then reconnect and merge with nothing
+lost and nothing duplicated.
 
 | Component | Role |
 |---|---|
@@ -169,7 +216,7 @@ mvn spring-boot:run
 ```
 
 ```bash
-mvn test          # 39 tests
+mvn test          # 46 tests
 ```
 
 ## Honest limitations
@@ -183,6 +230,8 @@ Things this deliberately does **not** do, so nobody has to discover them by surp
 - **One document.** There's a single shared document, not rooms or per-document sessions.
 - **In-memory only.** The operation log doesn't survive a restart.
 - **No authentication, no presence/cursors.** Out of scope for demonstrating the merge algorithm.
+- **Node.js is required for the cross-implementation conformance test.** It skips (rather than
+  fails) when Node is absent, so those four tests simply do not run on a JVM-only machine.
 
 ## Why RGA and not something else
 
