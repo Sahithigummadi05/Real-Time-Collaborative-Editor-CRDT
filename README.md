@@ -30,14 +30,15 @@ no transformation or arbitration is needed at all:
 - When two inserts compete for the same slot, both replicas resolve it by comparing ids under the
   same total order — so both independently reach the *same* answer with zero communication.
 
-That last rule is the whole algorithm, and it's four lines:
+That last rule is the whole algorithm, and it's a handful of lines:
 
 ```java
-var insertAt = indexOf(op.originId()) + 1;
-while (insertAt < elements.size() && elements.get(insertAt).id().compareTo(op.id()) > 0) {
-    insertAt++;   // walk past concurrent inserts that sort after this one
+var previous = origin;
+while (previous.next != null && previous.next.id.compareTo(op.id()) > 0) {
+    previous = previous.next;      // walk past concurrent inserts that sort after this one
 }
-elements.add(insertAt, element);
+node.next = previous.next;
+previous.next = node;
 ```
 
 Which character wins the earlier position is arbitrary — but it is arbitrary *identically
@@ -50,9 +51,10 @@ try, so the tests generate random edit histories across 4 replicas and replay ea
 different randomized delivery orders**, asserting every replay produces identical text. Ten seeds,
 60 operations each.
 
-Delivery orders are randomized but **causally valid** — an insert is never delivered before the
-character it attaches to. That's the standard precondition for CRDT convergence, so testing
-non-causal orders would be testing something the algorithm never promised.
+Those replays are randomized but **causally valid** — an insert never arrives before the character
+it attaches to — because that's the precondition textbook RGA is stated against. Delivery that
+violates causality is covered separately and more aggressively in
+[Surviving a network that reorders](#surviving-a-network-that-reorders) below.
 
 **And the tests are proven to have teeth.** `SkipRuleIsLoadBearingTest` reimplements the document
 with the ordering rule deleted — splicing each insert directly after its origin, which is the
@@ -64,12 +66,69 @@ proves nothing; this one demonstrably fails when the algorithm is broken.
 |---|---|
 | `RgaConvergenceTest` | Random 4-replica histories converge across 250 randomized causal replays |
 | `SkipRuleIsLoadBearingTest` | Removing RGA's ordering rule *does* cause divergence — the tests can fail |
+| `OutOfOrderDeliveryTest` | Convergence survives fully reversed and arbitrarily shuffled (non-causal) delivery |
 | `RgaDocumentTest` | Insert/delete/tombstone semantics, idempotent replay, Lamport clock advance |
+| `RgaPerformanceTest` | Insert cost stays flat as the document grows |
 | `EditorSyncIntegrationTest` | Two and three real WebSocket clients converge end-to-end through the running server |
 
 ```
-26 tests, 0 failures
+39 tests, 0 failures
 ```
+
+## Surviving a network that reorders
+
+Textbook RGA assumes **causal delivery** — an insert never arrives before the character it anchors
+to. A single ordered WebSocket satisfies that, so it's easy to build something that looks correct
+and quietly isn't.
+
+It isn't a safe assumption in general: multiple connections, peer-to-peer sync, a client replaying
+a partial log, or a reconnect that interleaves buffered and live traffic can all deliver an
+operation early. The first version of this code responded by guessing — an insert with no known
+origin was placed at the start of the document, and a delete for an unknown character was silently
+dropped, resurrecting it when the insert later arrived. Both are silent corruption.
+
+Now operations that arrive early are **buffered against the id they're waiting for** and applied
+the moment it lands, cascading transitively so one late operation can release a whole chain:
+
+```java
+var missing = missingDependency(op);
+if (missing != null) {
+    pending.computeIfAbsent(missing, k -> new ArrayList<>()).add(op);
+    return;                       // hold it — never guess a position
+}
+applyNow(op);
+releaseDependents(op.id());       // this may unblock a chain
+```
+
+`OutOfOrderDeliveryTest` delivers histories fully reversed, and in 160 arbitrary shuffles with no
+causality respected at all, requiring the final text to match in-order delivery exactly. The
+`indexOf` fallbacks that previously papered over this are now hard failures, because with
+buffering in place reaching them would mean a real invariant broke.
+
+## Performance
+
+Correct-but-quadratic is unusable for an editor, so scaling is measured rather than assumed
+(`mvn test -Dtest=RgaPerformanceTest`).
+
+The original implementation stored characters in an `ArrayList` with a map from id to array index.
+That map had to be rewritten on every insert, and resolving a caret position meant scanning the
+document — so cost grew with length. It was **quadratic**, and measurably so:
+
+| | Before (array + index map) | After (linked list + id→node map) |
+|---|---|---|
+| Append 16,000 chars | 504 ms | **13 ms** |
+| Prepend 8,000 chars (worst case) | 1,366 ms | **5 ms** |
+| Per-character cost | climbing: 7 → 10 → 31 µs | flat: ~0.6–1.1 µs |
+
+The fix was choosing the right data structure rather than micro-optimising the wrong one. A
+singly-linked list with a map from id to node removes index bookkeeping entirely — splicing is a
+pointer swap, origins are hash lookups, and a tail pointer makes appending O(1). Applying a remote
+operation is now **O(1) regardless of document size**; positions are resolved only where a human
+supplies one.
+
+What matters in that table isn't the speedup, it's that per-character cost stopped growing. A
+constant means the editor behaves the same in a 500-character note and a 50,000-character
+document.
 
 ## Architecture
 
@@ -95,7 +154,7 @@ a disconnected tab keeps working — its operations converge on reconnect.
 
 | Component | Role |
 |---|---|
-| `crdt/RgaDocument` | The algorithm. No Spring, no I/O, no threads — so convergence is directly testable |
+| `crdt/RgaDocument` | The algorithm — linked list + id→node map, with a buffer for early-arriving operations. No Spring, no I/O, no threads, so convergence is directly testable |
 | `crdt/OpId`, `crdt/Operation` | Identity and position-independent edits |
 | `ws/DocumentSession` | Server replica + operation log for late joiners |
 | `ws/EditorWebSocketHandler` | Fan-out relay |
@@ -110,18 +169,13 @@ mvn spring-boot:run
 ```
 
 ```bash
-mvn test          # 26 tests
+mvn test          # 39 tests
 ```
 
 ## Honest limitations
 
 Things this deliberately does **not** do, so nobody has to discover them by surprise:
 
-- **Causal delivery is assumed, not enforced.** Convergence is only guaranteed when an insert
-  arrives after the character it anchors to. A single WebSocket connection preserves order, which
-  is enough here — but a production build with multiple transports or peer-to-peer gossip needs a
-  buffer that holds operations until their dependencies arrive. `RgaDocument` currently degrades
-  gracefully rather than crashing when this is violated, which is not the same as being correct.
 - **Tombstones grow without bound.** Deleted characters are never reclaimed, so a long-lived
   document's memory grows with total edits, not current length. Real systems solve this with
   garbage collection once all replicas have acknowledged a deletion — which needs version vectors

@@ -35,6 +35,10 @@ export class RgaDocument {
     this.elements = [];
     this.applied = new Set();
     this.counter = 0;
+    // Operations that arrived before the element they anchor to, keyed by the id awaited.
+    // Mirrors the Java side: applying an insert with no origin present would misplace it.
+    this.pending = new Map();
+    this.buffered = new Set();
   }
 
   nextId() {
@@ -61,14 +65,61 @@ export class RgaDocument {
 
   apply(op) {
     const key = idKey(op.id);
-    if (this.applied.has(key)) return; // at-least-once delivery: ignore replays
-    this.applied.add(key);
+    // at-least-once delivery: ignore replays, and don't double-buffer a resend
+    if (this.applied.has(key) || this.buffered.has(key)) return;
+
+    const missing = this._missingDependency(op);
+    if (missing) {
+      const waitKey = idKey(missing);
+      if (!this.pending.has(waitKey)) this.pending.set(waitKey, []);
+      this.pending.get(waitKey).push(op);
+      this.buffered.add(key);
+      return;
+    }
+
+    this._applyNow(op);
+    this._releaseDependents(op.id);
+  }
+
+  /** Drains everything waiting on `arrived`, transitively — one late op can unblock a chain. */
+  _releaseDependents(arrived) {
+    const queue = [idKey(arrived)];
+    while (queue.length > 0) {
+      const waitKey = queue.shift();
+      const unblocked = this.pending.get(waitKey);
+      if (!unblocked) continue;
+      this.pending.delete(waitKey);
+      for (const waiting of unblocked) {
+        const key = idKey(waiting.id);
+        this.buffered.delete(key);
+        if (this.applied.has(key)) continue;
+        this._applyNow(waiting);
+        queue.push(key);
+      }
+    }
+  }
+
+  _applyNow(op) {
+    this.applied.add(idKey(op.id));
 
     // Keep this replica's clock ahead of anything it has observed.
     if (op.id.counter > this.counter) this.counter = op.id.counter;
 
     if (op.kind === 'insert') this._applyInsert(op);
     else if (op.kind === 'delete') this._applyDelete(op);
+  }
+
+  /** The element id this op needs before it can be applied, or null if it is ready. */
+  _missingDependency(op) {
+    let required = null;
+    if (op.kind === 'insert') required = idEquals(op.originId, HEAD) ? null : op.originId;
+    else if (op.kind === 'delete') required = op.targetId;
+    if (!required) return null;
+    return this._indexOf(required) >= 0 ? null : required;
+  }
+
+  pendingOperationCount() {
+    return this.buffered.size;
   }
 
   _applyInsert(op) {
